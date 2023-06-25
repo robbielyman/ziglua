@@ -431,7 +431,6 @@ test "panic fn" {
 
     // just test setting up the panic function
     // it uses longjmp so cannot return here to test
-    // TODO: perhaps a later version of zig can test an expected fail
     const panicFn = ziglua.wrap(struct {
         fn inner(l: *Lua) i32 {
             _ = l;
@@ -696,6 +695,52 @@ test "raise error" {
     lua.pushFunction(ziglua.wrap(makeError));
     try expectError(error.Runtime, lua.protectedCall(0, 0, 0));
     try expectEqualStrings("makeError made an error", try lua.toBytes(-1));
+}
+
+test "yielding" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    var thread = lua.newThread();
+    thread.pushFunction(ziglua.wrap(struct {
+        fn inner(l: *Lua) i32 {
+            l.pushInteger(1);
+            return l.yield(1);
+        }
+    }.inner));
+
+    _ = try thread.resumeThread(0);
+    try expectEqual(@as(Integer, 1), thread.toInteger(-1));
+}
+
+test "resuming" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    // here we create a Lua function that will run 5 times, continutally
+    // yielding a count until it finally returns the string "done"
+    var thread = lua.newThread();
+    thread.openLibs();
+    try thread.doString(
+        \\counter = function()
+        \\  coroutine.yield(1)
+        \\  coroutine.yield(2)
+        \\  coroutine.yield(3)
+        \\  coroutine.yield(4)
+        \\  coroutine.yield(5)
+        \\  return "done"
+        \\end
+    );
+    thread.getGlobal("counter");
+
+    var i: i32 = 1;
+    while (i <= 5) : (i += 1) {
+        try expectEqual(ziglua.ResumeStatus.yield, try thread.resumeThread(0));
+        try expectEqual(@as(Integer, i), thread.toInteger(-1));
+        lua.pop(lua.getTop());
+    }
+    try expectEqual(ziglua.ResumeStatus.ok, try thread.resumeThread(0));
+    try expectEqualStrings("done", try thread.toBytes(-1));
 }
 
 test "debug interface" {
@@ -1089,7 +1134,7 @@ test "args and errors" {
 
     const argCheck = ziglua.wrap(struct {
         fn inner(l: *Lua) i32 {
-            l.argCheck(true, 1, "error!");
+            l.argCheck(false, 1, "error!");
             return 0;
         }
     }.inner);
@@ -1114,11 +1159,11 @@ test "userdata" {
     defer lua.deinit();
 
     const Type = struct { a: i32, b: f32 };
-    try lua.newMetatable(@typeName(Type));
+    try lua.newMetatable("Type");
 
     const checkUdata = ziglua.wrap(struct {
         fn inner(l: *Lua) i32 {
-            const ptr = l.checkUserdata(Type, 1);
+            const ptr = l.checkUserdata(Type, 1, "Type");
             if (ptr.a != 1234) {
                 l.pushBytes("error!");
                 l.raiseError();
@@ -1135,7 +1180,7 @@ test "userdata" {
 
     {
         var t = lua.newUserdata(Type);
-        lua.getField(ziglua.registry_index, @typeName(Type));
+        lua.getField(ziglua.registry_index, "Type");
         lua.setMetatable(-2);
         t.a = 1234;
         t.b = 3.14;
@@ -1144,6 +1189,39 @@ test "userdata" {
         // correct metatable and values
         try lua.protectedCall(1, 1, 0);
     }
+}
+
+test "userdata slices" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    try lua.newMetatable("FixedArray");
+
+    // create an array of 10
+    const slice = lua.newUserdataSlice(Integer, 10);
+    lua.getField(ziglua.registry_index, "FixedArray");
+    lua.setMetatable(-2);
+
+    for (slice, 1..) |*item, index| {
+        item.* = @intCast(Integer, index);
+    }
+
+    const udataFn = struct {
+        fn inner(l: *Lua) i32 {
+            _ = l.checkUserdataSlice(Integer, 1, "FixedArray");
+            const arr = l.toUserdataSlice(Integer, 1) catch unreachable;
+            for (arr, 1..) |item, index| {
+                if (item != index) l.raiseErrorStr("something broke!", .{});
+            }
+
+            return 0;
+        }
+    }.inner;
+
+    lua.pushFunction(ziglua.wrap(udataFn));
+    lua.pushValue(2);
+
+    try lua.protectedCall(1, 0, 0);
 }
 
 test "refs" {
@@ -1193,4 +1271,9 @@ test "objectLen" {
 
     lua.pushString("lua");
     try testing.expectEqual(@as(usize, 3), lua.objectLen(-1));
+}
+
+test {
+    testing.refAllDecls(Lua);
+    testing.refAllDecls(Buffer);
 }

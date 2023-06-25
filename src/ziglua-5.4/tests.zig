@@ -560,7 +560,6 @@ test "panic fn" {
 
     // just test setting up the panic function
     // it uses longjmp so cannot return here to test
-    // TODO: perhaps a later version of zig can test an expected fail
     const panicFn = ziglua.wrap(struct {
         fn inner(l: *Lua) i32 {
             _ = l;
@@ -706,7 +705,7 @@ test "conversions" {
     var value: Integer = undefined;
     try Lua.numberToInteger(3.14, &value);
     try expectEqual(@as(Integer, 3), value);
-    try expectError(error.Fail, Lua.numberToInteger(@intToFloat(Number, ziglua.max_integer) + 10, &value));
+    try expectError(error.Fail, Lua.numberToInteger(@floatFromInt(Number, ziglua.max_integer) + 10, &value));
 
     // string conversion
     try lua.stringToNumber("1");
@@ -751,7 +750,7 @@ test "dump and load" {
     try lua.dump(ziglua.wrap(writer), &buffer, false);
 
     // clear the stack
-    try lua.resetThread();
+    try lua.closeThread(lua);
 
     const reader = struct {
         fn inner(l: *Lua, data: *anyopaque) ?[]const u8 {
@@ -1333,7 +1332,7 @@ test "loadBuffer" {
     var lua = try Lua.init(testing.allocator);
     defer lua.deinit();
 
-    _ = try lua.loadBuffer("global = 10", "chunkname");
+    _ = try lua.loadBuffer("global = 10", "chunkname", .text);
     try lua.protectedCall(0, ziglua.mult_return, 0);
     _ = try lua.getGlobal("global");
     try expectEqual(@as(Integer, 10), try lua.toInteger(-1));
@@ -1385,7 +1384,7 @@ test "args and errors" {
 
     const argCheck = ziglua.wrap(struct {
         fn inner(l: *Lua) i32 {
-            l.argCheck(true, 1, "error!");
+            l.argCheck(false, 1, "error!");
             return 0;
         }
     }.inner);
@@ -1460,16 +1459,16 @@ test "userdata" {
     defer lua.deinit();
 
     const Type = struct { a: i32, b: f32 };
-    try lua.newMetatable(@typeName(Type));
+    try lua.newMetatable("Type");
 
     var t = lua.newUserdata(Type, 0);
-    lua.setMetatableRegistry(@typeName(Type));
+    lua.setMetatableRegistry("Type");
     t.a = 1234;
     t.b = 3.14;
 
     const checkUdata = ziglua.wrap(struct {
         fn inner(l: *Lua) i32 {
-            const ptr = l.checkUserdata(Type, 1);
+            const ptr = l.checkUserdata(Type, 1, "Type");
             if (ptr.a != 1234) {
                 _ = l.pushBytes("error!");
                 l.raiseError();
@@ -1491,7 +1490,7 @@ test "userdata" {
 
     const testUdata = ziglua.wrap(struct {
         fn inner(l: *Lua) i32 {
-            const ptr = l.testUserdata(Type, 1) catch {
+            const ptr = l.testUserdata(Type, 1, "Type") catch {
                 _ = l.pushBytes("error!");
                 l.raiseError();
             };
@@ -1515,6 +1514,38 @@ test "userdata" {
     try lua.protectedCall(1, 0, 0);
 }
 
+test "userdata slices" {
+    var lua = try Lua.init(testing.allocator);
+    defer lua.deinit();
+
+    try lua.newMetatable("FixedArray");
+
+    // create an array of 10
+    const slice = lua.newUserdataSlice(Integer, 10, 0);
+    lua.setMetatableRegistry("FixedArray");
+    for (slice, 1..) |*item, index| {
+        item.* = @intCast(Integer, index);
+    }
+
+    const udataFn = struct {
+        fn inner(l: *Lua) i32 {
+            _ = l.checkUserdataSlice(Integer, 1, "FixedArray");
+            _ = l.testUserdataSlice(Integer, 1, "FixedArray") catch unreachable;
+            const arr = l.toUserdataSlice(Integer, 1) catch unreachable;
+            for (arr, 1..) |item, index| {
+                if (item != index) l.raiseErrorStr("something broke!", .{});
+            }
+
+            return 0;
+        }
+    }.inner;
+
+    lua.pushFunction(ziglua.wrap(udataFn));
+    lua.rotate(-2, 1);
+
+    try lua.protectedCall(1, 0, 0);
+}
+
 test "refs" {
     // tests for functions that aren't tested or will not be tested in ziglua
     // but ensures that the signatures are at least type checked
@@ -1522,9 +1553,13 @@ test "refs" {
     // no need to test file loading
     _ = Lua.doFile;
     _ = Lua.loadFile;
-    _ = Lua.loadFileX;
 
     // probably not needed in ziglua
     _ = Lua.execResult;
     _ = Lua.fileResult;
+}
+
+test {
+    testing.refAllDecls(Lua);
+    testing.refAllDecls(Buffer);
 }
